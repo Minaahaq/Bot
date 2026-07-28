@@ -1,1 +1,3 @@
-# Bot
+pyTelegramBotAPI
+requests
+beautifulsoup4
